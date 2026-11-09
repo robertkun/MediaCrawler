@@ -20,6 +20,8 @@
 import asyncio
 import os
 import random
+import time
+import urllib.parse
 from asyncio import Task
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -127,6 +129,60 @@ class DouYinCrawler(AbstractCrawler):
 
             utils.logger.info("[DouYinCrawler.start] Douyin Crawler finished ...")
 
+    async def _capture_search_from_browser(self, keyword: str) -> Optional[Dict]:
+        """打开搜索页，拦截浏览器自己发出的搜索接口响应（比直连 API 更贴近页面真实结果）。"""
+        search_url = f"https://www.douyin.com/search/{urllib.parse.quote(keyword)}?type=general"
+        utils.logger.info(f"[DouYinCrawler.search] Goto search page and wait API: {search_url}")
+        pending_responses: List[Any] = []
+        parsed: List[Dict] = []
+
+        def on_response(response) -> None:
+            try:
+                if "/aweme/v1/web/general/search/single/" not in response.url:
+                    return
+                if response.status != 200:
+                    return
+                pending_responses.append(response)
+            except Exception:  # noqa: BLE001
+                return
+
+        self.context_page.on("response", on_response)
+        try:
+            await self.context_page.goto(search_url, wait_until="domcontentloaded")
+            # 页面常先回空包再出结果；多等并滚动，解析拦截到的响应
+            deadline = time.monotonic() + 28
+            while time.monotonic() < deadline:
+                while pending_responses:
+                    response = pending_responses.pop(0)
+                    try:
+                        payload = await response.json()
+                    except Exception as exc:  # noqa: BLE001
+                        utils.logger.warning(f"[DouYinCrawler.search] intercept parse failed: {exc}")
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    parsed.append(payload)
+                    data = payload.get("data") or []
+                    utils.logger.info(
+                        f"[DouYinCrawler.search] intercepted search API: "
+                        f"data_len={len(data) if isinstance(data, list) else data}, "
+                        f"status_code={payload.get('status_code')}, "
+                        f"nil={payload.get('search_nil_info')}"
+                    )
+                    if isinstance(data, list) and data:
+                        return payload
+                try:
+                    await self.context_page.mouse.wheel(0, 1800)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(1.2)
+            return parsed[-1] if parsed else None
+        finally:
+            try:
+                self.context_page.remove_listener("response", on_response)
+            except Exception:  # noqa: BLE001
+                pass
+
     async def search(self) -> None:
         utils.logger.info("[DouYinCrawler.search] Begin search douyin keywords")
         dy_limit_count = 10  # douyin limit page fixed value
@@ -146,14 +202,53 @@ class DouYinCrawler(AbstractCrawler):
                     continue
                 try:
                     utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page}")
-                    posts_res = await self.dy_client.search_info_by_keyword(
-                        keyword=keyword,
-                        offset=page * dy_limit_count - dy_limit_count,
-                        publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
-                        search_id=dy_search_id,
-                    )
+                    posts_res: Dict = {}
+                    if page == start_page:
+                        intercepted = await self._capture_search_from_browser(keyword)
+                        await self.dy_client.update_cookies(
+                            browser_context=self.browser_context,
+                            urls=self.cookie_urls,
+                        )
+                        if intercepted and isinstance(intercepted.get("data"), list) and intercepted.get("data"):
+                            posts_res = intercepted
+                            utils.logger.info(
+                                f"[DouYinCrawler.search] use intercepted browser result, count={len(posts_res.get('data') or [])}"
+                            )
+                        else:
+                            utils.logger.info(
+                                "[DouYinCrawler.search] browser intercept empty, fallback to client API with retries"
+                            )
+                            await asyncio.sleep(3)
+                            for attempt in range(1, 4):
+                                posts_res = await self.dy_client.search_info_by_keyword(
+                                    keyword=keyword,
+                                    offset=page * dy_limit_count - dy_limit_count,
+                                    publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
+                                    search_id=dy_search_id,
+                                )
+                                data = posts_res.get("data")
+                                if isinstance(data, list) and data:
+                                    utils.logger.info(f"[DouYinCrawler.search] client API hit on retry {attempt}")
+                                    break
+                                utils.logger.info(
+                                    f"[DouYinCrawler.search] client API empty on retry {attempt}, "
+                                    f"data={data}, nil={posts_res.get('search_nil_info')}"
+                                )
+                                await asyncio.sleep(2 + attempt)
+                    else:
+                        posts_res = await self.dy_client.search_info_by_keyword(
+                            keyword=keyword,
+                            offset=page * dy_limit_count - dy_limit_count,
+                            publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
+                            search_id=dy_search_id,
+                        )
                     if posts_res.get("data") is None or posts_res.get("data") == []:
-                        utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")
+                        utils.logger.info(
+                            f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,"
+                            f"data={posts_res.get('data')}, status_code={posts_res.get('status_code')}, "
+                            f"status_msg={posts_res.get('status_msg')}, nil={posts_res.get('search_nil_info')}, "
+                            f"keys={list(posts_res.keys())}"
+                        )
                         break
                 except DataFetchError:
                     utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed")

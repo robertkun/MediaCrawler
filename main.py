@@ -125,7 +125,8 @@ async def async_cleanup() -> None:
     if crawler:
         if getattr(crawler, "cdp_manager", None):
             try:
-                await crawler.cdp_manager.cleanup(force=True)
+                # 不强制关闭：遵循 AUTO_CLOSE_BROWSER，便于搜索结束后保留页面
+                await crawler.cdp_manager.cleanup(force=False)
             except Exception as e:
                 error_msg = str(e).lower()
                 if "closed" not in error_msg and "disconnected" not in error_msg:
@@ -133,7 +134,10 @@ async def async_cleanup() -> None:
 
         elif getattr(crawler, "browser_context", None):
             try:
-                await crawler.browser_context.close()
+                if config.AUTO_CLOSE_BROWSER:
+                    await crawler.browser_context.close()
+                else:
+                    print("[Main] AUTO_CLOSE_BROWSER=False, keep browser context/page")
             except Exception as e:
                 error_msg = str(e).lower()
                 if "closed" not in error_msg and "disconnected" not in error_msg:
@@ -146,6 +150,10 @@ if __name__ == "__main__":
     from tools.app_runner import run
 
     def _force_stop() -> None:
+        # 仅在配置要求自动关闭时，中断才杀浏览器进程
+        if not config.AUTO_CLOSE_BROWSER:
+            print("[Main] AUTO_CLOSE_BROWSER=False, interrupt will keep browser running")
+            return
         c = crawler
         if not c:
             return

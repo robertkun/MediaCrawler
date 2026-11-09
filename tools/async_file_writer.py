@@ -21,7 +21,8 @@ import csv
 import json
 import os
 import pathlib
-from typing import Dict, List
+import re
+from typing import Dict, List, Optional, Set
 import aiofiles
 import config
 from tools.utils import utils
@@ -33,18 +34,62 @@ class AsyncFileWriter:
         self.platform = platform
         self.crawler_type = crawler_type
         self.wordcloud_generator = AsyncWordCloudGenerator() if config.ENABLE_GET_WORDCLOUD else None
+        self._seen_ids: Dict[str, Set[str]] = {}
 
-    def _get_file_path(self, file_type: str, item_type: str) -> str:
+    @staticmethod
+    def _safe_keyword(keyword: str) -> str:
+        text = (keyword or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r'[\\/:*?"<>|\s]+', "_", text)
+        text = re.sub(r"_+", "_", text).strip("._")
+        return text[:40]
+
+    def _item_id(self, item: Dict) -> Optional[str]:
+        for key in ("aweme_id", "note_id", "content_id", "video_id", "comment_id"):
+            value = item.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
+
+    def _get_file_path(self, file_type: str, item_type: str, keyword: str = "") -> str:
         if config.SAVE_DATA_PATH:
             base_path = f"{config.SAVE_DATA_PATH}/{self.platform}/{file_type}"
         else:
             base_path = f"data/{self.platform}/{file_type}"
         pathlib.Path(base_path).mkdir(parents=True, exist_ok=True)
-        file_name = f"{self.crawler_type}_{item_type}_{utils.get_current_date()}.{file_type}"
+        safe_kw = self._safe_keyword(keyword)
+        if safe_kw:
+            file_name = f"{self.crawler_type}_{item_type}_{safe_kw}_{utils.get_current_date()}.{file_type}"
+        else:
+            file_name = f"{self.crawler_type}_{item_type}_{utils.get_current_date()}.{file_type}"
         return f"{base_path}/{file_name}"
 
+    async def _load_existing_ids(self, file_path: str) -> Set[str]:
+        ids: Set[str] = set()
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            return ids
+        try:
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                async for line in f:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        obj = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict):
+                        item_id = self._item_id(obj)
+                        if item_id:
+                            ids.add(item_id)
+        except OSError:
+            return ids
+        return ids
+
     async def write_to_csv(self, item: Dict, item_type: str):
-        file_path = self._get_file_path('csv', item_type)
+        keyword = str(item.get("source_keyword") or "") if item_type == "contents" else ""
+        file_path = self._get_file_path('csv', item_type, keyword=keyword)
         async with self.lock:
             file_exists = os.path.exists(file_path)
             async with aiofiles.open(file_path, 'a', newline='', encoding='utf-8-sig') as f:
@@ -54,8 +99,19 @@ class AsyncFileWriter:
                 await writer.writerow(item)
 
     async def write_to_jsonl(self, item: Dict, item_type: str):
-        file_path = self._get_file_path('jsonl', item_type)
+        keyword = str(item.get("source_keyword") or "") if item_type == "contents" else ""
+        file_path = self._get_file_path('jsonl', item_type, keyword=keyword)
         async with self.lock:
+            item_id = self._item_id(item)
+            if item_id:
+                if file_path not in self._seen_ids:
+                    self._seen_ids[file_path] = await self._load_existing_ids(file_path)
+                if item_id in self._seen_ids[file_path]:
+                    utils.logger.info(
+                        f"[AsyncFileWriter.write_to_jsonl] skip duplicate {item_id} -> {file_path}"
+                    )
+                    return
+                self._seen_ids[file_path].add(item_id)
             async with aiofiles.open(file_path, 'a', encoding='utf-8') as f:
                 await f.write(json.dumps(item, ensure_ascii=False) + '\n')
 

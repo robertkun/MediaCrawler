@@ -53,6 +53,12 @@ class CDPBrowserManager:
 
         def sync_cleanup():
             """Synchronous cleanup function for atexit"""
+            # 尊重 AUTO_CLOSE_BROWSER：需要保留页面时不要在进程退出时杀浏览器
+            if not config.AUTO_CLOSE_BROWSER:
+                utils.logger.info(
+                    "[CDPBrowserManager] atexit: AUTO_CLOSE_BROWSER=False, keep browser running"
+                )
+                return
             if self.launcher and self.launcher.browser_process:
                 utils.logger.info("[CDPBrowserManager] atexit: Cleaning up browser process")
                 self.launcher.cleanup()
@@ -66,9 +72,14 @@ class CDPBrowserManager:
 
         def signal_handler(signum, frame):
             """Signal handler"""
-            utils.logger.info(f"[CDPBrowserManager] Received signal {signum}, cleaning up browser process")
-            if self.launcher and self.launcher.browser_process:
+            utils.logger.info(f"[CDPBrowserManager] Received signal {signum}")
+            if config.AUTO_CLOSE_BROWSER and self.launcher and self.launcher.browser_process:
+                utils.logger.info("[CDPBrowserManager] cleaning up browser process")
                 self.launcher.cleanup()
+            else:
+                utils.logger.info(
+                    "[CDPBrowserManager] AUTO_CLOSE_BROWSER=False, keep browser running"
+                )
 
             if signum == signal.SIGINT:
                 if prev_sigint == signal.default_int_handler:
@@ -442,6 +453,15 @@ class CDPBrowserManager:
             force: Whether to force cleanup browser process (ignoring AUTO_CLOSE_BROWSER config)
         """
         try:
+            # 需要保留浏览页面时：只断开 Playwright 引用，不关页面、不杀进程
+            if (not force) and (not config.AUTO_CLOSE_BROWSER):
+                utils.logger.info(
+                    "[CDPBrowserManager] Keep browser page/process running (AUTO_CLOSE_BROWSER=False)"
+                )
+                self.browser_context = None
+                self.browser = None
+                return
+
             # Close browser context
             if self.browser_context:
                 try:
